@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b1020">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>ベルヌーイ効果 デモ（PWA）</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; margin: 0; background:#0b1020; color:#e9eef5; }
+  header { padding: 14px 16px; background: #121a33; position: sticky; top: 0; z-index: 2; box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+  .wrap { padding: 14px 16px; max-width: 1000px; margin: 0 auto; }
+  #canvas { width: 100%; height: 460px; display: block; background: linear-gradient(#0b1020,#0f1836); border: 1px solid #2a3b7a; border-radius: 12px; }
+  .row { display:flex; gap:16px; flex-wrap: wrap; align-items:center; }
+  .card { background:#121a33; border:1px solid #243569; border-radius: 12px; padding:12px 14px; }
+  .label { font-size: 12px; opacity:0.9; }
+  input[type=range] { width: 260px; }
+  button { background:#2b74ff; color:white; border:none; padding:8px 12px; border-radius: 10px; cursor:pointer; font-weight:600; }
+  button.sec { background:#243569; }
+  .legend { display:flex; gap:12px; align-items:center; font-size: 13px; }
+  .dot { width:12px; height:12px; border-radius:50%; display:inline-block; }
+  .dot.speed { background:#4ac0ff; }
+  .dot.pressure { background:#ff6a7a; }
+  a { color:#8cc4ff; }
+  .install-tip { background:#1a254d; border:1px dashed #3a5bd1; border-radius:12px; padding:10px 14px; font-size:13px; margin-top:8px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px; flex-wrap:wrap;">
+        <div><strong>ベルヌーイ効果 デモ（PWA）</strong> — 「流速が上がると圧力が下がる」</div>
+        <div class="legend">
+          <span class="dot speed"></span>速い流れ（シアン）
+          <span class="dot pressure"></span>低圧（マゼンタ）
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="install-tip" id="tip" style="display:none;">
+      ホーム画面に追加するには：Safariで共有ボタン → <strong>ホーム画面に追加</strong> を選択。
+    </div>
+
+    <div class="row" style="margin-bottom:10px;">
+      <div class="card">
+        <div class="label">狭窄の強さ（0 = 直管 / 1 = かなり細い）</div>
+        <input id="narrowSlider" type="range" min="0" max="100" value="55" />
+      </div>
+      <div class="card">
+        <div class="label">粒子数</div>
+        <input id="particleSlider" type="range" min="100" max="900" value="550" />
+      </div>
+      <div class="card">
+        <div class="label">速度（基準）</div>
+        <input id="speedSlider" type="range" min="0" max="100" value="45" />
+      </div>
+      <div class="card">
+        <button id="toggleBtn">⏸ 停止</button>
+        <button id="resetBtn" class="sec">🔄 リセット</button>
+      </div>
+    </div>
+
+    <canvas id="canvas" width="1200" height="460"></canvas>
+
+    <p style="opacity:.9; line-height:1.6; margin-top:10px;">
+      このシミュレーションでは、中央部が細くなる管の中を粒子（空気/水の仮想粒子）が流れます。<br/>
+      流量一定（連続の式）とすると、<strong>断面積が小さいところほど流速 v が大きく</strong>なり、
+      ベルヌーイの式 <code>p + 1/2 ρ v² = 定数</code> より、<strong>静圧 p は下がります</strong>。<br/>
+      画面上では、シアンほど速く、マゼンタほど低圧を示します（正確な単位ではなく相対表示）。
+    </p>
+  </div>
+
+<script>
+// Register service worker for offline
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(console.warn);
+  });
+}
+
+// Simple iOS install tip (PWA)
+(function(){
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+  if(!isStandalone){
+    const el = document.getElementById('tip');
+    el.style.display = 'block';
+  }
+})();
+</script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const narrowSlider = document.getElementById('narrowSlider');
+  const particleSlider = document.getElementById('particleSlider');
+  const speedSlider = document.getElementById('speedSlider');
+  const toggleBtn = document.getElementById('toggleBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const W = canvas.width, H = canvas.height;
+  let particles = [];
+  let running = true;
+  let lastT = performance.now();
+
+  function wallY(xNorm, narrowK){
+    const baseHalf = H*0.35;
+    const cosBump = Math.cos((xNorm-0.5)*Math.PI*2);
+    const bump = (cosBump+1)/2;
+    const delta = bump * (H*0.25) * narrowK;
+    const half = Math.max(40, baseHalf - delta);
+    const mid = H/2;
+    return { top: mid - half, bottom: mid + half, half };
+  }
+
+  function initParticles(count){
+    particles = [];
+    for(let i=0;i<count;i++){
+      const x = Math.random()*W;
+      const wall = wallY(x/W, narrow());
+      const yy = wall.top + Math.random()*(wall.bottom - wall.top);
+      particles.push({ x, y: yy, vx: 0, vy: 0 });
+    }
+  }
+
+  function narrow(){ return +narrowSlider.value/100; }
+  function nParticles(){ return +particleSlider.value; }
+  function baseSpeed(){ return 20 + (+speedSlider.value); }
+
+  function localSpeed(xNorm, y, wall){
+    const W0 = H*0.7;
+    const Wx = (wall.bottom - wall.top);
+    let v = baseSpeed() * (W0 / Wx);
+    const yNorm = (y - wall.top) / (Wx);
+    const profile = 4*yNorm*(1 - yNorm);
+    v *= (0.3 + 0.7*profile);
+    return v;
+  }
+
+  function pressure01(v){
+    const vmax = 160;
+    let p = 1 - Math.min(1, (v*v)/(vmax*vmax));
+    return Math.max(0, Math.min(1, p));
+  }
+
+  function drawWalls(){
+    const k = narrow();
+    const gradTop = ctx.createLinearGradient(0,0,0,H);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#2a3b7a';
+    ctx.beginPath();
+    for(let i=0;i<=W;i+=4){
+      const wall = wallY(i/W, k);
+      if(i===0) ctx.moveTo(i, wall.top);
+      else ctx.lineTo(i, wall.top);
+    }
+    ctx.stroke();
+    ctx.beginPath();
+    for(let i=0;i<=W;i+=4){
+      const wall = wallY(i/W, k);
+      if(i===0) ctx.moveTo(i, wall.bottom);
+      else ctx.lineTo(i, wall.bottom);
+    }
+    ctx.stroke();
+  }
+
+  function step(dt){
+    const k = narrow();
+    for(const p of particles){
+      const xNorm = p.x / W;
+      const wall = wallY(xNorm, k);
+      if(p.y < wall.top){ p.y = wall.top + (wall.top - p.y); }
+      if(p.y > wall.bottom){ p.y = wall.bottom - (p.y - wall.bottom); }
+
+      const v = localSpeed(xNorm, p.y, wall);
+      p.x += v * dt;
+      p.y += (Math.random()-0.5) * 10 * dt;
+
+      if(p.x > W + 4){
+        p.x = -4;
+        const w2 = wallY(0, k);
+        p.y = w2.top + Math.random()*(w2.bottom - w2.top);
+      }
+    }
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    const k = narrow();
+    const colStopN = 160;
+    for(let i=0;i<=colStopN;i++){
+      const x = i/colStopN * W;
+      const wall = wallY(x/W, k);
+      const vMid = localSpeed(x/W, (wall.top+wall.bottom)/2, wall);
+      const p01 = pressure01(vMid);
+      const r = Math.floor(255 * (1 - p01));
+      const g = Math.floor(50 * p01);
+      const b = Math.floor(200 + 55 * p01);
+      ctx.fillStyle = `rgba(${r},${g},${b},0.12)`;
+      ctx.fillRect(x, wall.top, W/colStopN+2, wall.bottom - wall.top);
+    }
+    drawWalls();
+    for(const p of particles){
+      const wall = wallY(p.x/W, k);
+      const v = localSpeed(p.x/W, p.y, wall);
+      const speed01 = Math.min(1, v/160);
+      const r = Math.floor(40 + 40*speed01);
+      const g = Math.floor(160 + 80*speed01);
+      const b = Math.floor(200 + 55*speed01);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 1.6, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+    const txt = `狭窄:${(narrow()*100|0)}%  粒子:${particles.length}  速度:${baseSpeed()|0}px/s  （中央ほど速い=低圧）`;
+    ctx.fillText(txt, 12, 20);
+  }
+
+  function loop(t){
+    if(!running){ requestAnimationFrame(loop); return draw(); }
+    const dt = Math.min(0.05, (t - lastT)/1000);
+    lastT = t;
+    step(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  toggleBtn.addEventListener('click', () => {
+    running = !running;
+    toggleBtn.textContent = running ? '⏸ 停止' : '▶︎ 再開';
+  });
+
+  resetBtn.addEventListener('click', () => {
+    initParticles(nParticles());
+  });
+
+  particleSlider.addEventListener('input', () => initParticles(nParticles()));
+  narrowSlider.addEventListener('input', () => draw());
+  speedSlider.addEventListener('input', () => draw());
+
+  initParticles(nParticles());
+  draw();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
